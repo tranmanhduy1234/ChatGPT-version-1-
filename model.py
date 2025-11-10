@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
-
+from decoderblock_GPT import DecoderBlock
 def diagnose_checkpoint(checkpoint_path):
-    """Kiểm tra checkpoint có vấn đề gì"""
     print("\n" + "="*60)
     print("🔍 DIAGNOSING CHECKPOINT")
     print("="*60 + "\n")
@@ -38,16 +37,10 @@ def diagnose_checkpoint(checkpoint_path):
 # ============================================================================
 # 1. MINI CHAT GPT MODEL (từ training script)
 # ============================================================================
-'''
-Sửa lại khối decoder cho phù hợp với mô hình chatGPT -không có lớp cross-attention
-'''
 class MiniChatGPT(nn.Module):
-    """Improved Model"""
-    
     def __init__(self, vocab_size, max_seq_len=512, embed_dim=512, num_heads=8, 
                  num_layers=6, ffn_hidden_dim=2048, dropout=0.2, pad_token_id=1):
         super().__init__()
-        
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.pad_token_id = pad_token_id
@@ -56,27 +49,17 @@ class MiniChatGPT(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_token_id)
         self.positional_embedding = nn.Embedding(max_seq_len, embed_dim)
         self.dropout_embed = nn.Dropout(dropout)
-        
-        # Decoder with better initialization
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=ffn_hidden_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True  # ← Better stability
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.decoder_component = nn.ModuleList([
+            DecoderBlock(embed_dim=self.embed_dim, num_heads=num_heads, 
+                                               ffn_hidden_dim=ffn_hidden_dim, dropout=dropout, activation="swish")
+            for _ in range(num_layers)
+        ])
         self.norm_final = nn.LayerNorm(embed_dim)
-        
         # Output
         self.lm_head = nn.Linear(embed_dim, vocab_size, bias=True)
         self.lm_head.weight = self.token_embedding.weight
-        
         # Initialize weights
         self._init_weights()
-    
     def _init_weights(self):
         """Proper weight initialization"""
         for module in self.modules():
@@ -85,36 +68,53 @@ class MiniChatGPT(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.Embedding):
+                if module is self.token_embedding: 
+                    continue
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, input_ids, attention_mask=None):
         _, seq_len = input_ids.shape
-        
         token_emb = self.token_embedding(input_ids)
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
         pos_emb = self.positional_embedding(positions)
-        
-        x = token_emb + pos_emb
+        x = token_emb + pos_emb # => [batch_size, seq_len, d_model]
         x = self.dropout_embed(x)
         
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=input_ids.device, dtype=torch.bool),
-            diagonal=1
-        ) # dạng
-        # torch.triu(..., diagonal=1) → 
-        # [[0, 1, 1, 1],
-        # [0, 0, 1, 1],
-        # [0, 0, 0, 1],
-        # [0, 0, 0, 0]]  # True là 1 (masked), False là 0
-        
         padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        
-        x = self.decoder(x, x, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask)
-        x = self.norm_final(x)
-        
+        decoder_output = x
+        for decoder_layer in self.decoder_component:
+            decoder_output = decoder_layer(decoder_output, key_padding_mask = padding_mask)
+        x = self.norm_final(decoder_output)
         logits = self.lm_head(x)
         return logits
     
     def count_parameters(self):
         """Đếm tổng số parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+# if __name__=="__main__":
+#     model = MiniChatGPT(vocab_size=64000, max_seq_len=512, embed_dim=768, num_heads=8, 
+#                         num_layers=12, ffn_hidden_dim=3072, dropout=0.3, pad_token_id=1).to('cuda')
+#     x = torch.randint(0, 64000, (16, 512)).to('cuda')
+#     print(model.count_parameters())
+#     rs = model(x)
+#     print(rs.shape) # [batch_size, seq_len, 64000]
+    
+if __name__ == "__main__": 
+    from torchviz import make_dot
+
+    model = MiniChatGPT(vocab_size=64000, max_seq_len=512, embed_dim=768, num_heads=8, 
+                        num_layers=12, ffn_hidden_dim=3072, dropout=0.3, pad_token_id=1).to('cuda')
+    x = torch.randint(0, 64000, (16, 512), device='cuda')  # ví dụ vocab_size=10000, seq_len=512
+    print(f'Kích thước model {model.count_parameters()}')
+    Y = model(x)
+    loss = Y.sum()
+
+    # visualize before backward
+    dot = make_dot(loss, params=dict(model.named_parameters()))
+    dot.render("linear_cuda_graph", format="png")
+
+    # compute gradients
+    loss.backward(retain_graph=True)
+    print("Grad X:", x.grad)
+    print("Graph saved as linear_cuda_graph.png")

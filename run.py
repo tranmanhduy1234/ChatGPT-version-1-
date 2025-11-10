@@ -108,7 +108,7 @@ class ChatGPTInference:
             for i in range(max_length):
                 # Forward pass
                 outputs = self.model(input_ids)
-                
+                # [batch_size, seq_len, vocab]
                 # Get logits của token cuối cùng
                 next_token_logits = outputs[0, -1, :]
                 
